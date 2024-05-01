@@ -6,6 +6,8 @@
 #include "common.h"
 #include "whisper.h"
 
+#include <iostream>
+#include <cstdint>
 #include <cassert>
 #include <cstdio>
 #include <string>
@@ -36,6 +38,7 @@ struct whisper_params {
     bool tinydiarize   = false;
     bool save_audio    = false; // save audio to wav file
     bool use_gpu       = true;
+    bool stdin         = false;
 
     std::string language  = "en";
     std::string model     = "models/ggml-base.en.bin";
@@ -53,6 +56,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
             exit(0);
         }
         else if (arg == "-t"    || arg == "--threads")       { params.n_threads     = std::stoi(argv[++i]); }
+        else if (arg == "-s"    || arg == "--stdin")         { params.stdin         = true; }
         else if (                  arg == "--step")          { params.step_ms       = std::stoi(argv[++i]); }
         else if (                  arg == "--length")        { params.length_ms     = std::stoi(argv[++i]); }
         else if (                  arg == "--keep")          { params.keep_ms       = std::stoi(argv[++i]); }
@@ -89,6 +93,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "\n");
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h,       --help          [default] show this help message and exit\n");
+    fprintf(stderr, "  -s,       --stdin         [%-7s] use stdin for pcm16le stream\n",                   params.stdin ? "true" : "false");
     fprintf(stderr, "  -t N,     --threads N     [%-7d] number of threads to use during computation\n",    params.n_threads);
     fprintf(stderr, "            --step N        [%-7d] audio step size in milliseconds\n",                params.step_ms);
     fprintf(stderr, "            --length N      [%-7d] audio length in milliseconds\n",                   params.length_ms);
@@ -110,6 +115,64 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -sa,      --save-audio    [%-7s] save the recorded audio to a file\n",              params.save_audio ? "true" : "false");
     fprintf(stderr, "  -ng,      --no-gpu        [%-7s] disable GPU inference\n",                          params.use_gpu ? "false" : "true");
     fprintf(stderr, "\n");
+}
+
+
+// Create a global variable to hold the audio
+audio_async * audio = nullptr;
+
+void audio_init(whisper_params params){
+    if (params.stdin) {
+        fprintf(stderr, "Using stdin for audio input\n");
+    } else {
+        fprintf(stderr, "Using default audio input\n");
+        audio_async audio(params.length_ms);
+        if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
+            fprintf(stderr, "%s: audio.init() failed!\n", __func__);
+        }
+        ::audio = &audio;
+    }
+}
+
+void audio_resume() {
+    if (::audio) {
+        ::audio->resume();
+    }
+}
+void audio_pause() {
+    if (::audio) {
+        ::audio->pause();
+    }
+}
+void audio_clear() {
+    if (::audio) {
+        ::audio->clear();
+    }
+}
+
+bool audio_get(int ms, std::vector<float> & pcmf32) {
+    if (::audio) {
+        ::audio->get(ms, pcmf32);
+        return true;
+    } else{
+        // read 16bit little endian floats from stdin
+        const int n_samples = (ms*WHISPER_SAMPLE_RATE)/1000;
+        pcmf32.resize(n_samples);
+        int n_read = 0;
+        for (int i = 0; i < n_samples; i++) {
+            int16_t sample;
+            if (fread(&sample, sizeof(int16_t), 1, stdin)) {
+                pcmf32[i] = float(sample)/32768.0f;
+                n_read++;
+            }else if (feof(stdin)){
+                return false;
+            } else {
+                pcmf32.resize(i);
+                return true;
+            }
+        }
+        return true;
+    }
 }
 
 int main(int argc, char ** argv) {
@@ -136,14 +199,9 @@ int main(int argc, char ** argv) {
     params.max_tokens     = 0;
 
     // init audio
+    audio_init(params);
 
-    audio_async audio(params.length_ms);
-    if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
-        fprintf(stderr, "%s: audio.init() failed!\n", __func__);
-        return 1;
-    }
-
-    audio.resume();
+    audio_resume();
 
     // whisper init
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1){
@@ -239,16 +297,20 @@ int main(int argc, char ** argv) {
 
         if (!use_vad) {
             while (true) {
-                audio.get(params.step_ms, pcmf32_new);
+                is_running = audio_get(params.step_ms, pcmf32_new);
 
                 if ((int) pcmf32_new.size() > 2*n_samples_step) {
                     fprintf(stderr, "\n\n%s: WARNING: cannot process audio fast enough, dropping audio ...\n\n", __func__);
-                    audio.clear();
+                    audio_clear();
                     continue;
                 }
 
                 if ((int) pcmf32_new.size() >= n_samples_step) {
-                    audio.clear();
+                    audio_clear();
+                    break;
+                }
+
+                if(!is_running){
                     break;
                 }
 
@@ -281,10 +343,10 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
-            audio.get(2000, pcmf32_new);
+            audio_get(2000, pcmf32_new);
 
             if (::vad_simple(pcmf32_new, WHISPER_SAMPLE_RATE, 1000, params.vad_thold, params.freq_thold, false)) {
-                audio.get(params.length_ms, pcmf32);
+                audio_get(params.length_ms, pcmf32);
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -410,7 +472,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    audio.pause();
+    audio_pause();
 
     whisper_print_timings(ctx);
     whisper_free(ctx);
